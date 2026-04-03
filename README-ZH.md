@@ -127,6 +127,7 @@
 - [💡 核心优势](#-核心优势)
 - [🚀 快速启动](#-快速启动)
   - [🐳 Docker 部署](https://hub.docker.com/r/justlikemaki/aiclient-2-api)
+  - [🐙 GitHub Actions 与 Fork 同步](./docs/GITHUB_GHCR_FORK_SYNC-ZH.md)
   - [📋 核心功能](#-核心功能)
 - [🔐 授权配置指南](#-授权配置指南)
 - [📁 授权文件存储路径](#-授权文件存储路径)

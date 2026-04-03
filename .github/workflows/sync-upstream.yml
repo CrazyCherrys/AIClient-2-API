@@ -1,0 +1,112 @@
+name: 同步 Fork 上游更新
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 2 * * *'
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 解析上游仓库信息
+        id: upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RESPONSE=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}")
+
+          IS_FORK=$(printf '%s' "$RESPONSE" | jq -r '.fork')
+          if [ "$IS_FORK" != "true" ]; then
+            echo "is_fork=false" >> "$GITHUB_OUTPUT"
+            echo "当前仓库不是 GitHub fork，跳过同步。"
+            exit 0
+          fi
+
+          PARENT_FULL_NAME=$(printf '%s' "$RESPONSE" | jq -r '.parent.full_name')
+          PARENT_CLONE_URL=$(printf '%s' "$RESPONSE" | jq -r '.parent.clone_url')
+          PARENT_DEFAULT_BRANCH=$(printf '%s' "$RESPONSE" | jq -r '.parent.default_branch')
+
+          echo "is_fork=true" >> "$GITHUB_OUTPUT"
+          echo "full_name=$PARENT_FULL_NAME" >> "$GITHUB_OUTPUT"
+          echo "clone_url=$PARENT_CLONE_URL" >> "$GITHUB_OUTPUT"
+          echo "branch=$PARENT_DEFAULT_BRANCH" >> "$GITHUB_OUTPUT"
+
+          echo "检测到上游仓库: $PARENT_FULL_NAME ($PARENT_DEFAULT_BRANCH)"
+
+      - name: 配置 Git 身份
+        if: steps.upstream.outputs.is_fork == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 拉取上游代码
+        if: steps.upstream.outputs.is_fork == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream "${{ steps.upstream.outputs.clone_url }}" 2>/dev/null || \
+            git remote set-url upstream "${{ steps.upstream.outputs.clone_url }}"
+          git fetch upstream "${{ steps.upstream.outputs.branch }}" --tags
+
+      - name: 合并上游到当前默认分支
+        if: steps.upstream.outputs.is_fork == 'true'
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET_BRANCH="${{ github.event.repository.default_branch }}"
+          git fetch origin "$TARGET_BRANCH"
+          git checkout -B "$TARGET_BRANCH" "origin/$TARGET_BRANCH"
+          BEFORE_SHA=$(git rev-parse HEAD)
+
+          git merge --no-ff --no-edit "upstream/${{ steps.upstream.outputs.branch }}"
+
+          AFTER_SHA=$(git rev-parse HEAD)
+          if [ "$BEFORE_SHA" = "$AFTER_SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "当前 fork 已经是最新，无需推送。"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "检测到新的上游提交，已完成合并。"
+          fi
+
+      - name: 推送同步结果到 origin
+        if: steps.upstream.outputs.is_fork == 'true' && steps.merge.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"
+
+      - name: 生成同步摘要
+        shell: bash
+        run: |
+          {
+            echo "## Fork 同步结果"
+            echo ""
+            if [ "${{ steps.upstream.outputs.is_fork }}" != "true" ]; then
+              echo "- 当前仓库不是 GitHub fork，未执行同步。"
+              exit 0
+            fi
+
+            echo "- 上游仓库: \`${{ steps.upstream.outputs.full_name }}\`"
+            echo "- 上游分支: \`${{ steps.upstream.outputs.branch }}\`"
+            echo "- 目标分支: \`${{ github.event.repository.default_branch }}\`"
+            echo "- 是否有新提交: \`${{ steps.merge.outputs.changed || 'false' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
