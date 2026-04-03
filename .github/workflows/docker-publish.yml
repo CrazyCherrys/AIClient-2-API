@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - alpha
   workflow_dispatch:
 
 jobs:
@@ -50,7 +51,7 @@ jobs:
 
       - name: 检查 Git Tag 是否已存在
         id: check_tag
-        if: steps.version_changed.outputs.changed == 'true'
+        if: github.ref_name == 'main' && steps.version_changed.outputs.changed == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -63,7 +64,7 @@ jobs:
           fi
 
       - name: 创建 Git Tag
-        if: steps.version_changed.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
+        if: github.ref_name == 'main' && steps.version_changed.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
         shell: bash
         run: |
           set -euo pipefail
@@ -78,14 +79,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          REF_NAME="${{ github.ref_name }}"
           OWNER_LC=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           REPO_NAME=$(printf '%s' "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/$OWNER_LC/$REPO_NAME"
           SHORT_SHA=$(printf '%s' "${{ github.sha }}" | cut -c1-7)
-          TAGS="$IMAGE:latest"$'\n'"$IMAGE:sha-$SHORT_SHA"
+          TAGS="$IMAGE:sha-$SHORT_SHA"
 
-          if [ "${{ steps.version_changed.outputs.changed }}" = "true" ]; then
-            TAGS="$TAGS"$'\n'"$IMAGE:${{ steps.version.outputs.version }}"
+          if [ "$REF_NAME" = "main" ]; then
+            TAGS="$IMAGE:latest"$'\n'"$TAGS"
+
+            if [ "${{ steps.version_changed.outputs.changed }}" = "true" ]; then
+              TAGS="$TAGS"$'\n'"$IMAGE:${{ steps.version.outputs.version }}"
+            fi
+          elif [ "$REF_NAME" = "alpha" ]; then
+            TAGS="$IMAGE:alpha"$'\n'"$IMAGE:alpha-sha-$SHORT_SHA"
           fi
 
           {
