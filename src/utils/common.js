@@ -1,3 +1,4 @@
+export { MODEL_PROTOCOL_PREFIX, MODEL_PROVIDER } from './constants.js';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import * as http from 'http'; // Add http for IncomingMessage and ServerResponse types
@@ -6,6 +7,7 @@ import logger from './logger.js';
 import { convertData, getOpenAIStreamChunkStop } from '../convert/convert.js';
 import { ProviderStrategyFactory } from './provider-strategies.js';
 import { getPluginManager } from '../core/plugin-manager.js';
+import { MODEL_PROTOCOL_PREFIX, MODEL_PROVIDER } from './constants.js';
 
 // ==================== 网络错误处理 ====================
 
@@ -49,31 +51,26 @@ export const API_ACTIONS = {
     STREAM_GENERATE_CONTENT: 'streamGenerateContent',
 };
 
-export const MODEL_PROTOCOL_PREFIX = {
-    // Model provider constants
-    GEMINI: 'gemini',
-    OPENAI: 'openai',
-    OPENAI_RESPONSES: 'openaiResponses',
-    CLAUDE: 'claude',
-    CODEX: 'codex',
-    FORWARD: 'forward',
-    GROK: 'grok',
-}
+import {
+    usesManagedModelList,
+    getConfiguredSupportedModels
+} from '../providers/provider-models.js';
 
-export const MODEL_PROVIDER = {
-    // Model provider constants
-    GEMINI_CLI: 'gemini-cli-oauth',
-    ANTIGRAVITY: 'gemini-antigravity',
-    OPENAI_CUSTOM: 'openai-custom',
-    OPENAI_CUSTOM_RESPONSES: 'openaiResponses-custom',
-    CLAUDE_CUSTOM: 'claude-custom',
-    KIRO_API: 'claude-kiro-oauth',
-    QWEN_API: 'openai-qwen-oauth',
-    IFLOW_API: 'openai-iflow',
-    CODEX_API: 'openai-codex-oauth',
-    FORWARD_API: 'forward-api',
-    GROK_CUSTOM: 'grok-custom',
-    AUTO: 'auto',
+/**
+ * 获取指定提供商类型下，所有节点配置的已选模型列表（去重聚合）
+ * @param {object} providerPoolManager - 提供商池管理器
+ * @param {string} providerType - 提供商类型
+ * @returns {string[]} 聚合后的模型 ID 列表
+ */
+function getConfiguredSupportedModelsFromPool(providerPoolManager, providerType) {
+    if (!providerPoolManager?.providerStatus?.[providerType]) {
+        return [];
+    }
+
+    return [...new Set(
+        providerPoolManager.providerStatus[providerType]
+            .flatMap(providerStatus => getConfiguredSupportedModels(providerType, providerStatus.config))
+    )].sort((a, b) => a.localeCompare(b));
 }
 
 /**
@@ -822,6 +819,35 @@ export async function handleModelListRequest(req, res, service, endpointType, CO
 
         let clientModelList;
 
+        const buildConfiguredModelListResponse = (models, providerType, listEndpointType) => {
+            if (listEndpointType === ENDPOINT_TYPE.OPENAI_MODEL_LIST) {
+                return {
+                    object: 'list',
+                    data: models.map(model => ({
+                        id: model,
+                        object: 'model',
+                        created: Math.floor(Date.now() / 1000),
+                        owned_by: providerType
+                    }))
+                };
+            }
+
+            if (listEndpointType === ENDPOINT_TYPE.GEMINI_MODEL_LIST) {
+                return {
+                    models: models.map(model => ({
+                        name: `models/${model}`,
+                        baseModelId: model,
+                        version: 'v1',
+                        displayName: model,
+                        description: `Model ${model} provided by ${providerType}`,
+                        supportedGenerationMethods: ['generateContent', 'countTokens']
+                    }))
+                };
+            }
+
+            return { data: [] };
+        };
+
         // --- 核心逻辑: auto 路由模式下的模型聚合 ---
         if (CONFIG.MODEL_PROVIDER === MODEL_PROVIDER.AUTO && providerPoolManager) {
             logger.info(`[ModelList] Aggregating models for 'auto' mode...`);
@@ -829,6 +855,15 @@ export async function handleModelListRequest(req, res, service, endpointType, CO
         } else {
             // --- 单提供商逻辑 ---
             const toProvider = CONFIG.MODEL_PROVIDER;
+            const pooledSupportedModels = getConfiguredSupportedModelsFromPool(providerPoolManager, toProvider);
+            const configuredSupportedModels = pooledSupportedModels.length > 0
+                ? pooledSupportedModels
+                : getConfiguredSupportedModels(toProvider, CONFIG);
+
+            if (usesManagedModelList(toProvider) && configuredSupportedModels.length > 0) {
+                logger.info(`[ModelList] Returning configured supported models for ${toProvider}: ${configuredSupportedModels.join(', ')}`);
+                clientModelList = buildConfiguredModelListResponse(configuredSupportedModels, toProvider, endpointType);
+            } else {
 
             // service 可能未在上层预先注入（例如仅改了路径 provider 前缀），这里兜底获取
             let resolvedService = service;
@@ -851,6 +886,7 @@ export async function handleModelListRequest(req, res, service, endpointType, CO
                 clientModelList = convertData(nativeModelList, 'modelList', toProvider, fromProvider);
             } else {
                 logger.info(`[ModelList Convert] Model list format matches. No conversion needed.`);
+            }
             }
         }
 
