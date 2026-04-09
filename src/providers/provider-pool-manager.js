@@ -1985,6 +1985,22 @@ export class ProviderPoolManager {
             });
             return requests;
         }
+
+        // Codex OAuth 健康检查先构造标准 OpenAI messages，
+        // 再在这里显式转换为 Codex 所需的 responses input 格式
+        if (this._getBaseProviderType(providerType) === MODEL_PROVIDER.CODEX_API) {
+            const openAICompatibleRequest = {
+                model: modelName,
+                messages: [baseMessage]
+            };
+            requests.push(convertData(
+                openAICompatibleRequest,
+                'request',
+                MODEL_PROVIDER.OPENAI_CUSTOM,
+                MODEL_PROVIDER.CODEX_API
+            ));
+            return requests;
+        }
         
         // 其他提供商（OpenAI、Claude、Qwen）使用标准 messages 格式
         requests.push({
