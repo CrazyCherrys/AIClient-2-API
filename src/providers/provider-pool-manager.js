@@ -2,9 +2,13 @@ import * as fs from 'fs';
 import { getServiceAdapter, getRegisteredProviders } from './adapter.js';
 import logger from '../utils/logger.js';
 import { MODEL_PROVIDER, getProtocolPrefix } from '../utils/common.js';
-import { getProviderModels } from './provider-models.js';
-import { broadcastEvent } from '../ui-modules/event-broadcast.js';
 import { convertData } from '../convert/convert.js';
+import {
+    getConfiguredSupportedModels,
+    getProviderModels,
+    normalizeModelIds
+} from './provider-models.js';
+import { broadcastEvent } from '../ui-modules/event-broadcast.js';
 import { ENDPOINT_TYPE } from '../utils/common.js';
 
 /**
@@ -72,6 +76,7 @@ export class ProviderPoolManager {
         this.refreshBufferQueues = {}; // 按 providerType 分组的缓冲队列
         this.refreshBufferTimers = {}; // 按 providerType 分组的定时器
         this.bufferDelay = options.globalConfig?.REFRESH_BUFFER_DELAY ?? 5000; // 默认5秒缓冲延迟
+        this.refreshTaskTimeoutMs = options.globalConfig?.REFRESH_TASK_TIMEOUT_MS ?? 60000; // 默认60秒刷新超时
         
         // 用于并发选点时的原子排序辅助（自增序列）
         this._selectionSequence = 0;
@@ -183,6 +188,12 @@ export class ProviderPoolManager {
      */
     _enqueueRefresh(providerType, providerStatus, force = false) {
         const uuid = providerStatus.uuid;
+        
+        // 如果节点被禁用，不进行刷新
+        if (providerStatus.config.isDisabled) {
+            this._log('debug', `Skipping refresh for disabled node ${uuid}`);
+            return;
+        }
         
         // 如果已经在刷新中，直接返回
         if (this.refreshingUuids.has(uuid)) {
@@ -405,16 +416,18 @@ export class ProviderPoolManager {
             // 调用适配器的 refreshToken 方法（内部封装了具体的刷新逻辑）
             if (typeof serviceAdapter.refreshToken === 'function') {
                 const startTime = Date.now();
+                let refreshOperation;
                 if (force) {
                     if (typeof serviceAdapter.forceRefreshToken === 'function') {
-                        await serviceAdapter.forceRefreshToken();
+                        refreshOperation = serviceAdapter.forceRefreshToken();
                     } else {
                         this._log('warn', `forceRefreshToken not implemented for ${providerType}, falling back to refreshToken`);
-                        await serviceAdapter.refreshToken();
+                        refreshOperation = serviceAdapter.refreshToken();
                     }
                 } else {
-                    await serviceAdapter.refreshToken();
+                    refreshOperation = serviceAdapter.refreshToken();
                 }
+                await this._awaitRefreshWithTimeout(refreshOperation, providerType, providerStatus.uuid);
                 const duration = Date.now() - startTime;
                 this._log('info', `Token refresh successful for node ${providerStatus.uuid} (Duration: ${duration}ms)`);
                 
@@ -422,6 +435,8 @@ export class ProviderPoolManager {
                 config.needsRefresh = false;
                 config.refreshCount = 0;
                 config.lastRefreshTime = Date.now(); // 记录最后刷新成功时间
+                
+                this._debouncedSave(providerType);
             } else {
                 throw new Error(`refreshToken method not implemented for ${providerType}`);
             }
@@ -430,6 +445,31 @@ export class ProviderPoolManager {
             this._log('error', `Token refresh failed for node ${providerStatus.uuid}: ${error.message}`);
             this.markProviderUnhealthyImmediately(providerType, config, `Refresh failed: ${error.message}`);
             throw error;
+        }
+    }
+
+    /**
+     * 为刷新任务附加超时保护，避免单个适配器调用无限挂起。
+     * @private
+     */
+    async _awaitRefreshWithTimeout(refreshOperation, providerType, uuid) {
+        if (this.refreshTaskTimeoutMs <= 0) {
+            return await refreshOperation;
+        }
+
+        let timeoutId = null;
+        const timeoutPromise = new Promise((_, reject) => {
+            timeoutId = setTimeout(() => {
+                reject(new Error(`Refresh timeout after ${this.refreshTaskTimeoutMs}ms for node ${uuid} (${providerType})`));
+            }, this.refreshTaskTimeoutMs);
+        });
+
+        try {
+            return await Promise.race([Promise.resolve(refreshOperation), timeoutPromise]);
+        } finally {
+            if (timeoutId) {
+                clearTimeout(timeoutId);
+            }
         }
     }
 
@@ -626,51 +666,69 @@ export class ProviderPoolManager {
      * Initially, all providers are considered healthy and have zero usage.
      */
     initializeProviderStatus() {
+        const oldFullStatus = this.providerStatus || {};
+        const isColdStart = Object.keys(oldFullStatus).length === 0;
+        this.providerStatus = {}; // Tracks health and usage for each provider instance
         for (const providerType in this.providerPools) {
-            const oldStatus = this.providerStatus[providerType] || [];
+            const oldStatus = oldFullStatus[providerType] || [];
             this.providerStatus[providerType] = [];
             this.roundRobinIndex[providerType] = 0; // Initialize round-robin index for each type
             // 只有在锁不存在时才初始化，避免在运行中被重置导致并发问题
             if (!this._selectionLocks[providerType]) {
                 this._selectionLocks[providerType] = Promise.resolve();
             }
-            this.providerPools[providerType].forEach((providerConfig) => {
-                // 尝试从旧状态中恢复活跃请求计数和队列，避免重载配置时重置并发限制
-                const existing = oldStatus.find(p => p.uuid === providerConfig.uuid);
+            
+            const pool = this.providerPools[providerType];
+            
+            pool.forEach((providerConfig) => {
+                try {
+                    // 尝试从旧状态中恢复活跃请求计数和队列，避免重载配置时重置并发限制
+                    const existing = oldStatus.find(p => p.uuid === providerConfig.uuid);
 
-                // Ensure initial health and usage stats are present in the config
-                providerConfig.isHealthy = providerConfig.isHealthy !== undefined ? providerConfig.isHealthy : true;
-                providerConfig.isDisabled = providerConfig.isDisabled !== undefined ? providerConfig.isDisabled : false;
-                providerConfig.lastUsed = providerConfig.lastUsed !== undefined ? providerConfig.lastUsed : null;
-                providerConfig.usageCount = providerConfig.usageCount !== undefined ? providerConfig.usageCount : 0;
-                providerConfig.errorCount = providerConfig.errorCount !== undefined ? providerConfig.errorCount : 0;
-                
-                // --- V2: 刷新监控字段 ---
-                providerConfig.needsRefresh = providerConfig.needsRefresh !== undefined ? providerConfig.needsRefresh : false;
-                providerConfig.refreshCount = providerConfig.refreshCount !== undefined ? providerConfig.refreshCount : 0;
-                
-                // 优化2: 简化 lastErrorTime 处理逻辑
-                providerConfig.lastErrorTime = providerConfig.lastErrorTime instanceof Date
-                    ? providerConfig.lastErrorTime.toISOString()
-                    : (providerConfig.lastErrorTime || null);
-                
-                // 健康检测相关字段
-                providerConfig.lastHealthCheckTime = providerConfig.lastHealthCheckTime || null;
-                providerConfig.lastHealthCheckModel = providerConfig.lastHealthCheckModel || null;
-                providerConfig.lastErrorMessage = providerConfig.lastErrorMessage || null;
-                providerConfig.customName = providerConfig.customName || null;
-
-                this.providerStatus[providerType].push({
-                    config: providerConfig,
-                    uuid: providerConfig.uuid, // Still keep uuid at the top level for easy access
-                    type: providerType, // 保存 providerType 引用
-                    state: existing ? existing.state : {
-                        activeCount: 0,
-                        waitingCount: 0,
-                        queue: []
+                    // Ensure initial health and usage stats are present in the config
+                    providerConfig.isHealthy = providerConfig.isHealthy !== undefined ? providerConfig.isHealthy : true;
+                    providerConfig.isDisabled = providerConfig.isDisabled !== undefined ? providerConfig.isDisabled : false;
+                    providerConfig.lastUsed = providerConfig.lastUsed !== undefined ? providerConfig.lastUsed : null;
+                    providerConfig.usageCount = providerConfig.usageCount !== undefined ? providerConfig.usageCount : 0;
+                    providerConfig.errorCount = providerConfig.errorCount !== undefined ? providerConfig.errorCount : 0;
+                    
+                    // --- V2: 刷新监控字段 ---
+                    const persistedNeedsRefresh = providerConfig.needsRefresh !== undefined ? providerConfig.needsRefresh : false;
+                    const persistedRefreshCount = providerConfig.refreshCount !== undefined ? providerConfig.refreshCount : 0;
+                    if (isColdStart && (persistedNeedsRefresh || persistedRefreshCount > 0)) {
+                        this._log('info', `Resetting stale refresh state for provider ${providerConfig.uuid} (${providerType}) on startup.`);
                     }
-                });
+                    providerConfig.needsRefresh = isColdStart ? false : persistedNeedsRefresh;
+                    providerConfig.refreshCount = isColdStart ? 0 : persistedRefreshCount;
+                    
+                    // 优化2: 简化 lastErrorTime 处理逻辑
+                    providerConfig.lastErrorTime = providerConfig.lastErrorTime instanceof Date
+                        ? providerConfig.lastErrorTime.toISOString()
+                        : (providerConfig.lastErrorTime || null);
+                    
+                    // 健康检测相关字段
+                    providerConfig.lastHealthCheckTime = providerConfig.lastHealthCheckTime || null;
+                    providerConfig.lastHealthCheckModel = providerConfig.lastHealthCheckModel || null;
+                    providerConfig.lastErrorMessage = providerConfig.lastErrorMessage || null;
+                    providerConfig.customName = providerConfig.customName || null;
+
+                    this.providerStatus[providerType].push({
+                        config: providerConfig,
+                        uuid: providerConfig.uuid, // Still keep uuid at the top level for easy access
+                        type: providerType, // 保存 providerType 引用
+                        state: existing ? existing.state : {
+                            activeCount: 0,
+                            waitingCount: 0,
+                            queue: []
+                        }
+                    });
+                } catch (nodeError) {
+                    logger.error(`[ProviderPoolManager] Error initializing node for ${providerType}: ${nodeError.message}`);
+                }
             });
+            
+            // 确保初始化时的默认值补全也能写盘
+            this._debouncedSave(providerType);
         }
         this._log('info', `Initialized provider statuses: ok (maxErrorCount: ${this.maxErrorCount})`);
     }
@@ -831,6 +889,10 @@ export class ProviderPoolManager {
         // 如果指定了模型，则排除不支持该模型的提供商
         if (requestedModel) {
             const modelFilteredProviders = availableAndHealthyProviders.filter(p => {
+                const supportedModels = getConfiguredSupportedModels(providerType, p.config);
+                if (supportedModels.length > 0) {
+                    return supportedModels.includes(requestedModel);
+                }
                 // 如果提供商没有配置 notSupportedModels，则认为它支持所有模型
                 if (!p.config.notSupportedModels || !Array.isArray(p.config.notSupportedModels)) {
                     return true;
@@ -1228,14 +1290,32 @@ export class ProviderPoolManager {
         for (const providerType of allProviderTypes) {
             if (this.providerStatus[providerType]) {
                 let models = getProviderModels(providerType);
+                const configuredSupportedModels = normalizeModelIds(
+                    this.providerStatus[providerType].flatMap(providerStatus =>
+                        getConfiguredSupportedModels(providerType, providerStatus.config)
+                    )
+                );
+
+                if (configuredSupportedModels.length > 0) {
+                    models = configuredSupportedModels;
+                }
                 
                 // 如果硬编码的模型列表为空，或者该类型的提供商在号池中没有配置节点，尝试从服务获取
-                if (models.length === 0) {
+                // 只有在非号池模式，或者号池中有节点时才尝试获取，避免无节点时读取全局默认配置
+                if (models.length === 0 && (!this.providerStatus[providerType] || this.providerStatus[providerType].length > 0)) {
                     try {
                         // 确定使用的配置：优先使用号池中第一个节点的配置，否则使用全局配置
                         let targetConfig = this.globalConfig;
-                if (this.providerStatus[providerType] && this.providerStatus[providerType].length > 0) {
+                        if (this.providerStatus[providerType] && this.providerStatus[providerType].length > 0) {
                             targetConfig = this.providerStatus[providerType][0].config;
+                        } else {
+                            // 如果该提供商是属于号池类型的提供商（在 PROVIDER_MAPPINGS 中），且号池为空，则不应尝试读取全局配置
+                            const { PROVIDER_MAPPINGS } = await import('../utils/provider-utils.js');
+                            const isPoolable = PROVIDER_MAPPINGS.some(m => m.providerType === providerType);
+                            if (isPoolable) {
+                                this._log('debug', `Skipping model fetch for poolable provider ${providerType} with empty pool to avoid reading default config.`);
+                                continue;
+                            }
                         }
 
                         const tempConfig = {
@@ -1841,7 +1921,11 @@ export class ProviderPoolManager {
         
         for (const { providerType, provider, uuid, customName } of providersToCheck) {
             const providerCheckStart = Date.now();
-            const checkModelName = provider.config.checkModelName || ProviderPoolManager.DEFAULT_HEALTH_CHECK_MODELS[providerType] || 'unknown';
+            const baseProviderType = this._getBaseProviderType(providerType);
+            const checkModelName = provider.config.checkModelName || 
+                                ProviderPoolManager.DEFAULT_HEALTH_CHECK_MODELS[providerType] || 
+                                ProviderPoolManager.DEFAULT_HEALTH_CHECK_MODELS[baseProviderType] || 
+                                'unknown';
             const displayName = customName || uuid.substring(0, 8);
 
             try {
@@ -1903,11 +1987,27 @@ export class ProviderPoolManager {
         }
         
         // OpenAI Custom Responses 使用特殊格式
-        if (providerType === MODEL_PROVIDER.OPENAI_CUSTOM_RESPONSES) {
+        if (this._getBaseProviderType(providerType) === MODEL_PROVIDER.OPENAI_CUSTOM_RESPONSES) {
             requests.push({
                 input: [baseMessage],
                 model: modelName
             });
+            return requests;
+        }
+
+        // Codex OAuth 健康检查先构造标准 OpenAI messages，
+        // 再在这里显式转换为 Codex 所需的 responses input 格式
+        if (this._getBaseProviderType(providerType) === MODEL_PROVIDER.CODEX_API) {
+            const openAICompatibleRequest = {
+                model: modelName,
+                messages: [baseMessage]
+            };
+            requests.push(convertData(
+                openAICompatibleRequest,
+                'request',
+                MODEL_PROVIDER.OPENAI_CUSTOM,
+                MODEL_PROVIDER.CODEX_API
+            ));
             return requests;
         }
         
@@ -1918,6 +2018,26 @@ export class ProviderPoolManager {
         });
         
         return requests;
+    }
+
+    /**
+     * 根据提供商类型获取基准提供商类型（用于查找配置和模型）
+     * 例如：openai-custom-1 -> openai-custom
+     * @private
+     */
+    _getBaseProviderType(providerType) {
+        if (ProviderPoolManager.DEFAULT_HEALTH_CHECK_MODELS[providerType]) {
+            return providerType;
+        }
+        
+        // 尝试前缀匹配
+        for (const key of Object.keys(ProviderPoolManager.DEFAULT_HEALTH_CHECK_MODELS)) {
+            if (providerType === key || providerType.startsWith(key + '-')) {
+                return key;
+            }
+        }
+        
+        return providerType;
     }
 
     /**
@@ -1934,8 +2054,10 @@ export class ProviderPoolManager {
      */
     async _checkProviderHealth(providerType, providerConfig) {
         // 确定健康检查使用的模型名称
+        const baseProviderType = this._getBaseProviderType(providerType);
         const modelName = providerConfig.checkModelName ||
-                        ProviderPoolManager.DEFAULT_HEALTH_CHECK_MODELS[providerType];
+                        ProviderPoolManager.DEFAULT_HEALTH_CHECK_MODELS[providerType] ||
+                        ProviderPoolManager.DEFAULT_HEALTH_CHECK_MODELS[baseProviderType];
 
         if (!modelName) {
             this._log('warn', `Unknown provider type for health check: ${providerType}. Please check DEFAULT_HEALTH_CHECK_MODELS.`);

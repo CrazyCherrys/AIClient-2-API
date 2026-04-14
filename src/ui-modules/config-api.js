@@ -64,6 +64,7 @@ export async function handleGetConfig(req, res, currentConfig) {
         HOST: currentConfig.HOST,
         SERVER_PORT: currentConfig.SERVER_PORT,
         MODEL_PROVIDER: currentConfig.MODEL_PROVIDER,
+        DEFAULT_MODEL_PROVIDERS: currentConfig.DEFAULT_MODEL_PROVIDERS,
         SYSTEM_PROMPT_FILE_PATH: currentConfig.SYSTEM_PROMPT_FILE_PATH,
         SYSTEM_PROMPT_MODE: currentConfig.SYSTEM_PROMPT_MODE,
         PROMPT_LOG_BASE_NAME: currentConfig.PROMPT_LOG_BASE_NAME,
@@ -76,6 +77,7 @@ export async function handleGetConfig(req, res, currentConfig) {
         LOGIN_EXPIRY: currentConfig.LOGIN_EXPIRY,
         PROVIDER_POOLS_FILE_PATH: currentConfig.PROVIDER_POOLS_FILE_PATH,
         MAX_ERROR_COUNT: currentConfig.MAX_ERROR_COUNT,
+        SYSTEM_PROMPT_REPLACEMENTS: currentConfig.SYSTEM_PROMPT_REPLACEMENTS,
         WARMUP_TARGET: currentConfig.WARMUP_TARGET,
         REFRESH_CONCURRENCY_PER_PROVIDER: currentConfig.REFRESH_CONCURRENCY_PER_PROVIDER,
         providerFallbackChain: currentConfig.providerFallbackChain,
@@ -114,7 +116,12 @@ export async function handleUpdateConfig(req, res, currentConfig) {
 
         // Update config values in memory（含类型校验）
         if (newConfig.REQUIRED_API_KEY !== undefined) {
-            if (typeof newConfig.REQUIRED_API_KEY === 'string') currentConfig.REQUIRED_API_KEY = newConfig.REQUIRED_API_KEY;
+            if (typeof newConfig.REQUIRED_API_KEY === 'string') {
+                // 如果是脱敏后的字符串，则忽略更新，保留原值
+                if (newConfig.REQUIRED_API_KEY !== '******') {
+                    currentConfig.REQUIRED_API_KEY = newConfig.REQUIRED_API_KEY;
+                }
+            }
         }
         if (newConfig.HOST !== undefined) {
             if (typeof newConfig.HOST === 'string' && newConfig.HOST.length > 0) currentConfig.HOST = newConfig.HOST;
@@ -147,6 +154,11 @@ export async function handleUpdateConfig(req, res, currentConfig) {
             }
         }
         if (newConfig.SYSTEM_PROMPT_MODE !== undefined) currentConfig.SYSTEM_PROMPT_MODE = newConfig.SYSTEM_PROMPT_MODE;
+        if (newConfig.SYSTEM_PROMPT_REPLACEMENTS !== undefined) {
+            if (Array.isArray(newConfig.SYSTEM_PROMPT_REPLACEMENTS)) {
+                currentConfig.SYSTEM_PROMPT_REPLACEMENTS = newConfig.SYSTEM_PROMPT_REPLACEMENTS;
+            }
+        }
         if (newConfig.PROMPT_LOG_BASE_NAME !== undefined) currentConfig.PROMPT_LOG_BASE_NAME = newConfig.PROMPT_LOG_BASE_NAME;
         if (newConfig.PROMPT_LOG_MODE !== undefined) currentConfig.PROMPT_LOG_MODE = newConfig.PROMPT_LOG_MODE;
         if (newConfig.REQUEST_MAX_RETRIES !== undefined) {
@@ -282,6 +294,7 @@ export async function handleUpdateConfig(req, res, currentConfig) {
                 MODEL_PROVIDER: currentConfig.MODEL_PROVIDER,
                 SYSTEM_PROMPT_FILE_PATH: currentConfig.SYSTEM_PROMPT_FILE_PATH,
                 SYSTEM_PROMPT_MODE: currentConfig.SYSTEM_PROMPT_MODE,
+                SYSTEM_PROMPT_REPLACEMENTS: currentConfig.SYSTEM_PROMPT_REPLACEMENTS,
                 PROMPT_LOG_BASE_NAME: currentConfig.PROMPT_LOG_BASE_NAME,
                 PROMPT_LOG_MODE: currentConfig.PROMPT_LOG_MODE,
                 REQUEST_MAX_RETRIES: currentConfig.REQUEST_MAX_RETRIES,
@@ -401,13 +414,23 @@ export async function handleUpdateAdminPassword(req, res) {
 
         if (!password || password.trim() === '') {
             res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: { message: 'Password cannot be empty' } }));
+            res.end(JSON.stringify({ 
+                error: { 
+                    message: 'Password cannot be empty',
+                    messageCode: 'common.passwordEmpty'
+                } 
+            }));
             return true;
         }
 
         if (password.trim().length < PASSWORD.MIN_LENGTH) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: { message: `Password must be at least ${PASSWORD.MIN_LENGTH} characters` } }));
+            res.end(JSON.stringify({ 
+                error: { 
+                    message: `Password must be at least ${PASSWORD.MIN_LENGTH} characters`,
+                    messageCode: 'common.passwordTooShort'
+                } 
+            }));
             return true;
         }
 
