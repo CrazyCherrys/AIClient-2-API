@@ -487,13 +487,20 @@ export class ProviderPoolManager {
                 } else {
                     refreshOperation = serviceAdapter.refreshToken();
                 }
-                await this._awaitRefreshWithTimeout(refreshOperation, providerType, providerStatus.uuid);
+                const refreshResult = await this._awaitRefreshWithTimeout(refreshOperation, providerType, providerStatus.uuid);
+                
+                // 处理返回 false 的情况（部分适配器可能不抛出异常而是返回 false）
+                if (refreshResult === false) {
+                    throw new Error('Refresh operation returned false');
+                }
+
                 const duration = Date.now() - startTime;
                 this._log('info', `Token refresh successful for node ${providerStatus.uuid} (Duration: ${duration}ms)`);
                 
                 // 刷新成功，统一重置状态
                 config.needsRefresh = false;
                 config.refreshCount = 0;
+                config.errorCount = 0; // 刷新成功也重置错误计数
                 config.lastRefreshTime = Date.now(); // 记录最后刷新成功时间
                 
                 this._debouncedSave(providerType);
@@ -503,7 +510,29 @@ export class ProviderPoolManager {
 
         } catch (error) {
             this._log('error', `Token refresh failed for node ${providerStatus.uuid}: ${error.message}`);
-            this.markProviderUnhealthyImmediately(providerType, config, `Refresh failed: ${error.message}`);
+            
+            // 记录错误信息
+            config.lastErrorTime = new Date().toISOString();
+            config.lastErrorMessage = `Refresh failed: ${error.message}`;
+            
+            // 增加错误计数（用于普通的健康检查参考，虽然刷新错误主要参考 refreshCount）
+            config.errorCount = (config.errorCount || 0) + 1;
+
+            // 只有当刷新重试次数达到上限（5次）时，才标记为不健康
+            // 注意：refreshCount 在进入本方法后的 try 块前已经自增（L466）
+            if (config.refreshCount >= 5) {
+                this.markProviderUnhealthyImmediately(providerType, config, `Refresh failed after maximum attempts (5): ${error.message}`);
+            } else {
+                // 关键修复：重置 needsRefresh 为 false，允许该节点回到池中
+                // 这样它才有机会被下一次请求选中，从而再次触发刷新重试
+                config.needsRefresh = false;
+
+                // 增加冷却保护：更新 lastRefreshTime，利用 markProviderNeedRefresh 中的 30s 保护逻辑，
+                // 防止因瞬时高并发请求导致 5 次重试机会在短时间内被耗尽。
+                config.lastRefreshTime = Date.now(); 
+                
+                this._debouncedSave(providerType);
+            }
             throw error;
         }
     }
@@ -741,6 +770,16 @@ export class ProviderPoolManager {
             
             const pool = this.providerPools[providerType];
             
+            // 如果是同步配置，主动使该类型下所有已有的服务适配器失效，确保代理等设置能即时生效
+            if (syncFromConfig) {
+                this._log('info', `Syncing config for type ${providerType}, invalidating existing service adapters to apply new proxy settings.`);
+                pool.forEach(config => {
+                    if (config.uuid) {
+                        invalidateServiceAdapter(providerType, config.uuid);
+                    }
+                });
+            }
+            
             pool.forEach((providerConfig) => {
                 try {
                     // 尝试从旧状态中恢复活跃请求计数和队列，避免重载配置时重置并发限制
@@ -751,9 +790,15 @@ export class ProviderPoolManager {
                     providerConfig.isDisabled = providerConfig.isDisabled !== undefined ? providerConfig.isDisabled : false;
                     
                     // --- V3: 统计数据管理 ---
-                    if (isColdStart || syncFromConfig) {
-                        // 冷启动或强制同步：使用传入配置中的统计数据
-                        // 如果传入配置中没有，则初始化为默认值
+                    if (isColdStart && !syncFromConfig) {
+                        // 冷启动：清空所有统计数据，确保重启后计数重置
+                        providerConfig.lastUsed = null;
+                        providerConfig.usageCount = 0;
+                        providerConfig.errorCount = 0;
+                        providerConfig.lastErrorTime = null;
+                        providerConfig.lastErrorMessage = null;
+                    } else if (syncFromConfig) {
+                        // 强制同步：从配置中恢复统计数据
                         providerConfig.lastUsed = providerConfig.lastUsed || null;
                         providerConfig.usageCount = providerConfig.usageCount || 0;
                         providerConfig.errorCount = providerConfig.errorCount || 0;
